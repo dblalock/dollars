@@ -31,7 +31,10 @@ TINY_VAL = 1e-10
 # def _leveraged_etfs_df():
 LEVERAGED_ETFS_DF = pd.read_csv('leverage-symbol-mappings.csv')
 LEVERAGED_ETFS_DF = LEVERAGED_ETFS_DF.loc[LEVERAGED_ETFS_DF['isMonthly'] == 0]
+LEVERAGED_ETFS_DF['Symbol'] = LEVERAGED_ETFS_DF['Symbol'].str.upper()
+LEVERAGED_ETFS_DF['LeveragedSymbol'] = LEVERAGED_ETFS_DF['LeveragedSymbol'].str.upper()  # noqa
 LEVERAGED_ETFS_DF.drop('isMonthly', axis=1, inplace=True)
+LEVERAGED_SYMBOLS = set(LEVERAGED_ETFS_DF['LeveragedSymbol'])
 
 
 if not os.path.exists(HISTORIES_DIR):
@@ -70,17 +73,25 @@ def _blacklisted_phrases():
     # return ('closed end', 'strategic', 'tactical', 'hedged')
 
 
-def _check_symbol_relevant(sym, name, sizeCutoffBytes=100e3,
+@_memory.cache
+def _check_symbol_relevant(sym, name='', sizeCutoffBytes=100e3,
                            dateCutoff=START_DATE, minAnnualRet=1.01,
                            minAnnualRetOverDayStd=1.5):
+    sym = sym.upper()
     cutoff_date = _parse_iso_date(dateCutoff)
     blacklisted_phrases = _blacklisted_phrases()
 
     path = _history_path_for_symbol(sym)
 
+    if sym in LEVERAGED_SYMBOLS:
+        return True  # we handpicked these; enough history once we impute it
+
     name = name.lower()
     if any([phrase in name for phrase in blacklisted_phrases]):
         return False  # exclude closed-end funds, tactical funds
+
+    # if name.startwith('^'):
+    #     return False  # can't invest in an index directly
 
     if os.path.getsize(path) < sizeCutoffBytes:
         return False  # too small
@@ -125,9 +136,8 @@ def _check_symbol_relevant(sym, name, sizeCutoffBytes=100e3,
 
 @_memory.cache
 def all_relevant_symbols(**kwargs):
-    ret = []
-
     df = all_symbols_and_names()
+    ret = []
     symbols, names = df['Symbol'], df['Name']
     for sym, name in zip(symbols, names):
         print("checking symbol: ", sym)
@@ -160,7 +170,7 @@ def all_relevant_symbols(**kwargs):
 
 
 def _history_path_for_symbol(symbol):
-    return os.path.join(HISTORIES_DIR, symbol + '.csv')
+    return os.path.join(HISTORIES_DIR, symbol.upper() + '.csv')
 
 
 def _download_history_for_symbol(symbol, startat=None, **kwargs):
@@ -333,37 +343,56 @@ def _impute_history_for_leveraged_etf(
 
 def _load_history_for_leveraged_symbol(symbol, start_date=START_DATE):
     # print("LEVERAGED_ETFS_DF", LEVERAGED_ETFS_DF)
+    symbol = symbol.upper()
     idx = np.where(
-        LEVERAGED_ETFS_DF['LeveragedSymbol'].str.lower() == symbol)[0][0]
+        LEVERAGED_ETFS_DF['LeveragedSymbol'].str.upper() == symbol)[0][0]
     print("idx: ", idx)
     print("LEVERAGED_ETFS_DF['Symbol'].values[idx]", LEVERAGED_ETFS_DF['Symbol'].values[idx])
     print("LEVERAGED_ETFS_DF['Leverage'].values[idx]", LEVERAGED_ETFS_DF['Leverage'].values[idx])
     tracks_symbol = LEVERAGED_ETFS_DF['Symbol'].values[idx]
     leverage = float(LEVERAGED_ETFS_DF['Leverage'].values[idx])
     tracks_history = _load_history_for_symbol(
-        tracks_symbol, start_date=None)
+        tracks_symbol, start_date=start_date)
     leveraged_history = _load_history_for_symbol(
-        symbol, start_date=None)
-    return _impute_history_for_leveraged_etf(
+        symbol, start_date=None, can_recurse=False)
+
+    if tracks_history is None:  # underlying symbol not old enough
+        return None
+
+    df = _impute_history_for_leveraged_etf(
         leveraged_history, tracks_history, leverage)
 
+    if start_date is not None:
+        startdatetime = _parse_iso_date(start_date)
+        if startdatetime < df.index[0]:
+            return None   # fail fast if start_date is too early
+        df = df[startdatetime:]
 
-def _load_history_for_symbol(symbol, start_date=START_DATE):
+    return df
+
+
+def _load_history_for_symbol(symbol, start_date=START_DATE, can_recurse=True):
+    symbol = symbol.upper()
+
+    if can_recurse and symbol in LEVERAGED_SYMBOLS:
+        return _load_history_for_leveraged_symbol(symbol, start_date=start_date)
+
     df = pd.read_csv(_history_path_for_symbol(symbol))
     df.fillna(inplace=True, axis=0, method='ffill')  # forward fill nans
 
-    print("symbol: ", symbol)
+    print("loading history for symbol: ", symbol)
 
     if start_date is not None:
         # dates = [_parse_iso_date(datestr) for datestr in df['Date']]
-        idx = np.where(df['Date'].values == start_date)[0][0]
-        print("start_date: ", start_date)
-        print("idx: ", idx)
+        try:
+            idx = np.where(df['Date'].values == start_date)[0][0]
+        except IndexError:
+            return None  # asked for a date before the start date
+        # print("start_date: ", start_date)
+        # print("idx: ", idx)
         df = df.iloc[idx:]
     # df['Date'] = df['Date'].apply(_parse_iso_date)
     df.set_index(pd.DatetimeIndex(df['Date']), inplace=True)
-
-    # cutoff_date =
 
     # handle missing values
     opens = df['Open'].values
@@ -375,79 +404,25 @@ def _load_history_for_symbol(symbol, start_date=START_DATE):
     opens = np.maximum(TINY_VAL, opens)
     closes = np.maximum(TINY_VAL, closes)
 
-    # day_changes = opens[1:] - opens[:-1]
-    # intraday_changes = closes - opens
-
-    # print("df cols", df.dtypes)
-    # print("df shape: ", df.shape)
-
-    # dividends = df['Dividends'].values.astype(np.float64)
-
-    # EDIT: looks like the price info is "adjusted price" which takes into
-    # account dividends already
-    #   -so what I actually need to do is construct a price col, not a
-    #   total return one
-    #   -https://ca.help.yahoo.com/kb/finance/adjusted-close-sln28256.html
-
-    # splits = df['Stock Splits'].values
-    # idxs = np.where(splits != 0)[0]
-    # print("splits: ", splits[idxs])
-    # print("split dates: ", df['Date'].values[idxs])
-    # # assert(dividends.shape == splits.shape)
-    # splits[splits == 0] = 1.  # 0 = no change, so really 1
-
-    # # this is probably wrong, but the combo of reverse splits and dividends
-    # # yields insane total returns
-    # if splits.min() < 1:
-    #     splits[:idxs[-1]] = 1
-    # # splits[splits < 1] = 1
-
-    # split_coeffs = np.cumprod(splits[::-1])[::-1]
-    # assert split_coeffs.min() > 0
-    # diffs = split_coeffs[1:] - split_coeffs[-1:]
-    # assert diffs.min() <= 0
-    # old_dividends = dividends.copy()
-    # dividends /= split_coeffs
-    # # dividends *= split_coeffs
-    # if splits.min() >= 1:
-    #     assert np.all(dividends <= old_dividends)
-    # # print("adjusted and orig dividends:")
-    # print(dividends[dividends > 0][:20])
-    # print(old_dividends[dividends > 0][:20])
-
-    # df = df['Date Dividends'.split()]
-    # print("min close: ", closes.min())
-    # print("max close: ", closes.max())
-
-    # dividends = df['Dividends'].values
-    # assert dividends.min() == 0
-    # print("closes num nans: ", np.isnan(closes).sum())
-    # print("dividends num nans: ", np.isnan(dividends).sum())
     df['rel24h'] = _compute_relative_changes(closes)
     df['relDay'] = closes / opens
     df['price'] = _compute_prices(closes, df['Dividends'].values)
-    # df['relDiv'] = dividends / closes
-    # df['returns'] = _compute_compound_returns(closes, dividends)
-
-    # priceret_total = df['Close'].values[-1] / max(TINY_VAL, df['Close'].values[0])
-    # print("final and initial prices: ", df['Close'].values[-1], df['Close'].values[0])
-    # print("final and initial dates: ", df['Date'].values[-1], df['Date'].values[0])
-    # ret_total = df['returns'].values[-1]
 
     return df[['Date', 'Close', 'Dividends',
                'rel24h', 'relDay', 'price']]
-    # df.drop(['Open High Low Close Volume'.split() + ['Stock Splits']],
-    #         axis=1, inplace=True)
-    # return df
 
 
 @_memory.cache
 def _load_monthly_history_for_symbol(symbol, start_date=START_DATE):
     dailydf = _load_history_for_symbol(symbol, start_date)
+    if dailydf is None:
+        return dailydf  # fail fast if symbol doesn't go back far enough
+
     df = dailydf.asfreq('M', method='ffill')
     df['maxClose'] = dailydf['Close'].resample('M').max()
     df['minClose'] = dailydf['Close'].resample('M').min()
     df['relMonth'] = _compute_relative_changes(df['Close'].values)
+
     df.drop(['Date', 'rel24h', 'relDay', 'Dividends'], axis=1, inplace=True)
     return df
 
@@ -525,22 +500,12 @@ def _unexplained_variance_loglinear(returns, weights='sqrt'):
 
     fraction_unexplained = rss / sse
     return fraction_unexplained
-    # return sse, rss
-
-    # return_total = returns[-1] / returns[0]
-    # return return_total / fraction_unexplained
-
-
-    # yhat_norm =
-
-    # w, rss, _, _ = np.linalg.listsq(x, y)
-    # w, rss, _, _ = np.linalg.listsq(x, y)
-
-    # yhat = x.reshape(-1, 1) @ w
 
 
 def _get_monthly_stats_for_symbol(sym, start_date=START_DATE):
     df = _load_monthly_history_for_symbol(sym, start_date=start_date)
+    if df is None:
+        return None
     # nmonths = df.shape[0]
     # nyears = nmonths / 12
     # ndays = nyears * 365.25
@@ -698,6 +663,7 @@ def _get_monthly_stats_for_symbol(sym, start_date=START_DATE):
 def get_monthly_stats_df(start_date=START_DATE):
     dicts = [_get_monthly_stats_for_symbol(sym, start_date)
              for sym in all_relevant_symbols()]
+    dicts = [d for d in dicts if d is not None]  # not enough history
     return pd.DataFrame.from_records(dicts)
 
 
@@ -713,11 +679,13 @@ def get_returns_daily_stds_df(start_date=START_DATE):
 
 
 def _load_master_df(start_date=START_DATE):
-    symbols = all_relevant_symbols()
-    sym = symbols[0]
-    df = _load_history_for_symbol(sym)
-    for symbol in all_symbols()[1:2]:
-        pass # TODO
+    sym2closes = {}
+    for symbol in all_relevant_symbols():
+        # df = _load_history_for_symbol(sym)
+        df = _load_monthly_history_for_symbol(symbol, start_date=start_date)
+        sym2closes[symbol] = df['Close'].values
+
+    # TODO finish this function
 
 
 # def _leverage_for_symbol(sym):
@@ -726,32 +694,38 @@ def _load_master_df(start_date=START_DATE):
 
 
 def main():
+    # _download_history_for_symbol('^vix')
+    # return
 
-    # df = get_monthly_stats_df()
-    # df = df.loc[df['cagrStable'] > 1.05]
-    # # df = df.loc[df['annual'] > 1.05]
-    # df = df.loc[df['annual'] > 1.1]
-    # # df = df.loc[df['qqqCorr'] < .25]
-    # print("monthly stats: ")
-    # # df.sort_values(by='cagrStable', axis=0, inplace=True, ascending=False)
-    # # df.sort_values(by='qqqCorr', axis=0, inplace=True, ascending=True)
-    # # df.sort_values(by='cagrStable', axis=0, inplace=True, ascending=False)
-    # # df.sort_values(by='cagrEfficiency', axis=0, inplace=True, ascending=False)
-    # # df.sort_values(by='cagrRss', axis=0, inplace=True, ascending=False)
-    # # df.sort_values(by='cagrRssCorr', axis=0, inplace=True, ascending=False)
-    # # df.sort_values(by='cagrDrawdown', axis=0, inplace=True, ascending=False)
+    df = get_monthly_stats_df()
+    df = df.loc[df['cagrStable'] > 1.05]
+    # df = df.loc[df['annual'] > 1.05]
+    df = df.loc[df['annual'] > 1.1]
+    # df = df.loc[df['qqqCorr'] < .25]
+    print("monthly stats: ")
+    # df.sort_values(by='cagrStable', axis=0, inplace=True, ascending=False)
+    # df.sort_values(by='qqqCorr', axis=0, inplace=True, ascending=True)
+    # df.sort_values(by='cagrStable', axis=0, inplace=True, ascending=False)
+    # df.sort_values(by='cagrEfficiency', axis=0, inplace=True, ascending=False)
+    # df.sort_values(by='cagrRss', axis=0, inplace=True, ascending=False)
+    # df.sort_values(by='cagrRssCorr', axis=0, inplace=True, ascending=False)
+    # df.sort_values(by='cagrDrawdown', axis=0, inplace=True, ascending=False)
     # df.sort_values(by='cagrAll', axis=0, inplace=True, ascending=False)
+    df.sort_values(by='annual', axis=0, inplace=True, ascending=False)
     # df['stableSharpe'] *= 1e2
     # df['stableSortino'] *= 1e2
-    # # df = df['symbol annual cagrEfficiency upwardFracLog cagr15y cagrStable stableSharpe qqqCorr'.split()]
-    # # df = df['symbol annual cagrDrawdown maxDrawdown cagrRssCorr cagrRss unexplainedFrac cagr5y cagrStable qqqCorr'.split()]
-    # # df = df['symbol annual cagrDrawdown maxDrawdown unexplainedFrac cagrRssCorr cagrRss qqqCorr'.split()]
-    # # df = df['symbol annual cagrAll maxDrawdown unexplainedFrac cagrRssCorr cagrRss qqqCorr'.split()]
-    # df = df['symbol annual cagrAll cagrCorrDown maxDrawdown unexplainedFrac qqqCorr'.split()]
-    # # df = df['symbol annual cagrDrawdown maxDrawdown unexplainedFrac qqqCorr'.split()]
-    # print(df.head(50))
-    # # print(df.head())
-    # return
+    # df = df['symbol annual cagrEfficiency upwardFracLog cagr15y cagrStable stableSharpe qqqCorr'.split()]
+    # df = df['symbol annual cagrDrawdown maxDrawdown cagrRssCorr cagrRss unexplainedFrac cagr5y cagrStable qqqCorr'.split()]
+    # df = df['symbol annual cagrDrawdown maxDrawdown unexplainedFrac cagrRssCorr cagrRss qqqCorr'.split()]
+    # df = df['symbol annual cagrAll maxDrawdown unexplainedFrac cagrRssCorr cagrRss qqqCorr'.split()]
+    df = df['symbol annual cagrAll cagrCorrDown maxDrawdown unexplainedFrac qqqCorr'.split()]
+    # df = df['symbol annual cagrDrawdown maxDrawdown unexplainedFrac qqqCorr'.split()]
+    print(df.head(50))
+
+    # # print('symbol relevant?', _check_symbol_relevant('tqqq'))
+    # df = get_monthly_stats_df()
+    # print(df.loc[df['symbol'].str.lower() == 'tqqq'])
+    return
 
     # d = _get_monthly_stats_for_symbol('msft')
     # # d = _get_monthly_stats_for_symbol('aapl')
@@ -768,20 +742,31 @@ def main():
 
     # _download_history_for_symbol('^GSPC')
 
-    # df = _load_monthly_history_for_symbol('tlt')
-    # df = _load_history_for_symbol('tlt')
-    # df = _load_history_for_leveraged_symbol('tmf')
-    # df = _load_history_for_leveraged_symbol('spxl')
-    # df = _load_history_for_leveraged_symbol('need')
-    df = _load_history_for_leveraged_symbol('cure')
-    # df = _load_history_for_leveraged_symbol('tqqq')
-    print("history df cols: ", df.columns.values)
-    print("leverage df cols: ", LEVERAGED_ETFS_DF.columns.values)
-    print(df['Close'].index[:10])
-    df['Close'].plot()
-    plt.gca().semilogy()
-    plt.show()
-    return
+    # # # # # df = _load_monthly_history_for_symbol('tlt')
+    # # # # # df = _load_history_for_symbol('tlt')
+    # # # # # df = _load_history_for_leveraged_symbol('tmf')
+    # # # # # df = _load_history_for_leveraged_symbol('spxl')
+    # # # # # df = _load_history_for_leveraged_symbol('need')
+    # # # # # df = _load_history_for_leveraged_symbol('cure')
+    # # # # df = _load_history_for_leveraged_symbol('pill')
+    # # # df = _load_history_for_leveraged_symbol('tqqq')
+    # # # df = _load_history_for_leveraged_symbol('tqqq', start_date=None)
+    # # # df = _load_history_for_symbol('tqqq', start_date=None)
+    # # df = _load_history_for_symbol('cure', start_date=None)
+    # # df = _load_monthly_history_for_symbol('cure', start_date=None)
+    # # df = _load_monthly_history_for_symbol('CURE', start_date=None)
+    # # df = _load_monthly_history_for_symbol('CURE', start_date='2004-11-19')
+    # df = _load_monthly_history_for_symbol('cure', start_date='2004-11-19')
+    # df = _load_monthly_history_for_symbol('mdu', start_date='2004-11-19')
+    # df = _load_monthly_history_for_symbol('midu', start_date=START_DATE)
+    # df = _load_monthly_history_for_symbol('midu', start_date=None)
+    # print("history df cols: ", df.columns.values)
+    # print("leverage df cols: ", LEVERAGED_ETFS_DF.columns.values)
+    # print(df['Close'].index[:10])
+    # df['Close'].plot()
+    # plt.gca().semilogy()
+    # plt.show()
+    # return
 
     # # df0 = _load_history_for_symbol('spy')
     # # print(_monthly_corr_with_qqq(df, start_date=START_DATE, col='relMonth'))
