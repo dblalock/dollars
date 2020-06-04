@@ -1,9 +1,10 @@
 LeveragedSymbol,Symbol,Leverage,isMonthly
 tqqq,^ndx,3,0
+qld,^ndx,2,0
 spxl,^gspc,3,0
 need,xlp,3,0
 want,xly,3,0
-yinn,flch,3,0
+yinn,fxi,3,0
 pill,pjp,3,0
 cure,xlv,3,0
 nugt,gdx,3,0
