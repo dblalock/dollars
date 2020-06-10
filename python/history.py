@@ -5,6 +5,7 @@ import datetime
 import numpy as np
 import os
 import pandas as pd
+import pickle
 import time
 import yfinance as yf
 
@@ -184,19 +185,48 @@ def _history_path_for_symbol(symbol):
     return os.path.join(HISTORIES_DIR, symbol.upper() + '.csv')
 
 
-def _download_history_for_symbol(symbol, startat=None, **kwargs):
-    if startat is not None and symbol < startat:
-        return
+def _download_history_for_symbol(symbol, start='1921-01-01', **kwargs):
+    # if startat is not None and symbol < startat:
+    #     return
+
+    # TODO this is currently broken for old symbols
+    # ...although I remember concluding I couldn't fix it?
+
     kwargs.setdefault('period', 'max')  # download all data by default
     print(f"downloading history for {symbol}...")
-    df = yf.Ticker(symbol).history(**kwargs)
+    df = yf.Ticker(symbol).history(start=start, **kwargs)
     df.to_csv(_history_path_for_symbol(symbol))
     time.sleep(max(.5, 1 + np.random.randn()))
 
 
-def download_histories(startat=None):
+def _info_path_for_symbol(sym):
+    return f'../data/infos/{sym}.pickle'
+
+
+def _download_info_for_symbol(sym):
+    print(f"downloading info for symbol: {sym}")
+    d = yf.Ticker(sym).info
+    with open(_info_path_for_symbol(sym), 'wb') as f:
+        pickle.dump(d, f)
+    time.sleep(max(.5, 1 + np.random.randn()))
+
+
+def download_infos():
+    for symbol in all_relevant_symbols():
+        _download_history_for_symbol(symbol)
+
+
+def load_info(sym):
+    path = _info_path_for_symbol(sym)
+    if not os.path.exists(path):
+        _download_info_for_symbol(sym)
+    with open(_info_path_for_symbol(sym), 'rb') as f:
+        return pickle.load(f)
+
+
+def download_histories():
     for symbol in all_symbols():
-        _download_history_for_symbol(symbol, startat=startat)
+        _download_history_for_symbol(symbol)
 
 
 def download_100y_old_histories(startat=None):
@@ -598,6 +628,13 @@ def _get_monthly_stats_for_symbol(sym, start_date=START_DATE):
     ret['wcagrAll'] = (ret['wcagr'] - 1) * (
         drawdown_coef * corrmultiplier * rss_multiplier) + 1
 
+    info = load_info(sym)
+    try:
+        ret['fwdOverTrailingPE'] = info['forwardPE'] / info['trailingPE']
+        ret['peg'] = info['forwardPE'] ** 2 / info['trailingPE']
+    except (KeyError, TypeError):
+        pass
+
     # misc other stats
     ret.update(dict(
         symbol=sym,
@@ -637,6 +674,13 @@ def load_master_df(start_date=None, dateCutoff=START_DATE, impute=False):
         maxlen = np.max([len(ar) for ar in sym2closes.values()])
         new_sym2closes = {}
         # preprend_buff = np.zeros(maxlen, dtype=np.float)
+
+
+        # XXX TODO need to actually align stuff based on dates and/or fail
+        # fast if start and end dates don't match up like we think they should
+
+
+
         for sym, ar in sym2closes.items():
             newar = np.zeros(maxlen, dtype=np.float)
             newar[-len(ar):] = ar
@@ -649,17 +693,74 @@ def load_master_df(start_date=None, dateCutoff=START_DATE, impute=False):
     return df
 
 
+def _clean_options_df(df):
+    # df = df.loc[df['contractSize'] == 'REGULAR']
+    df = df['strike lastPrice bid ask volume impliedVolatility inTheMoney'.split()]
+    df.fillna(0, inplace=True)
+    return df
+
+
+@_memory.cache
+def options_for_symbol(symbol, date=None):
+    calls, puts = yf.Ticker(symbol).option_chain(date=date)
+
+    return _clean_options_df(calls), _clean_options_df(puts)
+
+
+def load_history(sym, resolution='week', start_date=None):
+    if resolution == 'day':
+        df = _load_history_for_symbol(sym, start_date=start_date)
+    elif resolution == 'week':
+        df = _load_history_for_symbol(sym, start_date=start_date)
+        # df = dailydf.asfreq('M', method='ffill')
+        df = df.asfreq('W-SUN', method='ffill')
+    elif resolution == 'month':
+        df = _load_monthly_history_for_symbol(sym, start_date=start_date)
+    else:
+        raise ValueError('resolution must be one of: "{}"'.format(
+            '", "'.join('day, week, month'.split())))
+    return df
+
+
+def load_pdf(sym, resolution='day', window_len=1):
+    df = load_history(sym, resolution=resolution)
+    assert window_len >= 1
+    closes = df['Close'].values
+    # if window_len == 1:
+    #     return np.sort(closes)
+    return np.sort(closes[window_len:] / closes[:-window_len])
+    # return df['Close'].rolling(duration_len) - df['Close'].rolling(duration_len)
+    # log2closes = np.log2(df['Close'].values)
+    # series = pd.Series(log2closes)
+    # return np.pow(2, series.rolling(duration_len).sum())
+
+
+
+
 def main():
+
+
+    # # rets = load_pdf('tqqq', resolution='day')
+    # # sym = 'tqqq'
+    # # calls, puts = yf.Ticker('spy').option_chain(date='2020-06-19')
+    # # calls, puts = options_for_symbol('spy', '2020-06-18')
+    # calls, puts = options_for_symbol('spxl', '2020-06-18')
+    # print("calls cols: ", calls.columns)
+    # # calls = calls[[strike]]
+    # print(calls)
+    # return
+
+    # # download_100y_old_histories()
+    # # df = load_master_df()
+    # # df = _load_monthly_history_for_symbol('ZVV', start_date=None)
+    # _download_history_for_symbol('ZVV', start_date=None)
+    # # print("df shape: ", df.shape)
+    # return
+
     # print("number of relevant symbols: ", len(all_relevant_symbols()))
 
     # _download_history_for_symbol('^DJI')
     # return
-
-
-    df = load_master_df()
-    # df = _load_monthly_history_for_symbol('YINN', start_date=None)
-    print("df shape: ", df.shape)
-    return
 
 
     df = get_monthly_stats_df()
@@ -680,7 +781,8 @@ def main():
     # df.sort_values(by='cagrRssCorr', axis=0, inplace=True, ascending=False)
     # df.sort_values(by='cagrDrawdown', axis=0, inplace=True, ascending=False)
     # df.sort_values(by='cagrAll', axis=0, inplace=True, ascending=False)
-    df.sort_values(by='wcagrAll', axis=0, inplace=True, ascending=False)
+    # df.sort_values(by='wcagrAll', axis=0, inplace=True, ascending=False)
+    df.sort_values(by='peg', axis=0, inplace=True, ascending=False)
     # df.sort_values(by='maxLev', axis=0, inplace=True, ascending=False)
     # df.sort_values(by='wcagr', axis=0, inplace=True, ascending=False)
     # df.sort_values(by='annual', axis=0, inplace=True, ascending=False)
@@ -694,7 +796,7 @@ def main():
     # df = df['symbol annual cagrAll maxDrawdown unexplainedFrac qqqCorr'.split()]
     # df = df['symbol wcagr annual wcagrAll maxLev maxDrawdown unexplainedFrac qqqCorr'.split()]
     # df = df['symbol wcagr cagrRss wcagrAll maxLev maxDrawdown unexplainedFrac qqqCorr'.split()]
-    df = df['symbol annual wcagrAll cagrDrawdown maxLev maxDrawdown unexplainedFrac qqqCorr'.split()]
+    df = df['symbol annual peg wcagrAll cagrDrawdown maxLev maxDrawdown unexplainedFrac qqqCorr'.split()]
     # df = df['symbol annual wcagr maxDrawdown unexplainedFrac qqqCorr'.split()]
     # df = df['symbol annual relMean cagrAll cagrCorrDown maxDrawdown unexplainedFrac qqqCorr'.split()]
     # df = df['symbol annual cagrDrawdown maxDrawdown unexplainedFrac qqqCorr'.split()]
