@@ -8,11 +8,12 @@ import matplotlib.pyplot as plt
 import history
 
 
-def plot_pdf(sym, resolution='day', window_len=1):
+def plot_pdf(sym, resolution='day', window_len=1, **pdf_kwargs):
     _, axes = plt.subplots(2, 4, figsize=(16, 8))
 
     sym = sym.upper()
-    rets = history.load_pdf(sym, resolution=resolution, window_len=window_len)
+    rets = history.load_pdf(
+        sym, resolution=resolution, window_len=window_len, **pdf_kwargs)
     logrets = np.log2(rets)
     retmean = rets.mean()
     retstd = rets.std()
@@ -37,22 +38,29 @@ def plot_pdf(sym, resolution='day', window_len=1):
     for i, ax in enumerate(axes[:, 0]):
         ax.set_title(f'{sym} {window_len}-{resolution} Relative Returns')
         distplot(rets, ax=ax)
-        ax.plot([1, 1], [0, ax.get_ylim()[1]], 'k--')
+        upper_ylim = ax.get_ylim()[1]
+        ax.plot([1, 1], [0, upper_ylim], 'k--')
+        ax.plot([retmean, retmean], [0, upper_ylim], 'g.-')
         # if i == 1:
         #     ax.semilogy()
     # for i, ax in enumerate(axes[1]):
     for i, ax in enumerate(axes[:, 1]):
         ax.set_title(f'{sym} {window_len}-{resolution} Log2 Relative Returns')
         distplot(logrets, ax=ax)
-        ax.plot([0, 0], [0, ax.get_ylim()[1]], 'k--')
+        upper_ylim = ax.get_ylim()[1]
+        ax.plot([0, 0], [0, upper_ylim], 'k--')
+        # ax.plot([retmean, retmean], [0, ax.get_ylim()[1]], 'g.-')
     for i, ax in enumerate(axes[:, 2]):
         ax.set_title(f'{sym} {window_len}-{resolution} Gauss Relative Returns')
         distplot(gauss_rets, ax=ax, using_gauss=True)
-        ax.plot([1, 1], [0, ax.get_ylim()[1]], 'k--')
+        upper_ylim = ax.get_ylim()[1]
+        ax.plot([1, 1], [0, upper_ylim], 'k--')
+        ax.plot([retmean, retmean], [0, upper_ylim], 'g.-')
     for i, ax in enumerate(axes[:, 3]):
         ax.set_title(f'{sym} {window_len}-{resolution} Log2 Gauss Relative Returns')
         distplot(loggauss_rets, ax=ax, using_gauss=True)
         ax.plot([0, 0], [0, ax.get_ylim()[1]], 'k--')
+        # ax.plot([retmean, retmean], [0, ax.get_ylim()[1]], 'g.-')
     for ax in axes[1]:
         ax.semilogy()
     for i, ax in enumerate(axes[:, 2]):
@@ -64,15 +72,16 @@ def plot_pdf(sym, resolution='day', window_len=1):
 
 
 def main():
-    # sym = 'midu'
-    sym = 'tqqq'
+    sym = 'midu'
+    # sym = 'tqqq'
     # sym = 'spy'
     # sym = '^gspc'
     # sym = 'qqq'
     resolution = 'month'
     window_len = 18
     # window_len = 6
-    plot_pdf(sym, resolution, window_len)
+    start_date = '2002-01-04' if sym.endswith('qqq') else None
+    plot_pdf(sym, resolution, window_len, start_date=start_date)
     return
 
 

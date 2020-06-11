@@ -697,14 +697,43 @@ def _clean_options_df(df):
     # df = df.loc[df['contractSize'] == 'REGULAR']
     df = df['strike lastPrice bid ask volume impliedVolatility inTheMoney'.split()]
     df.fillna(0, inplace=True)
+    maxprices = np.maximum(df['bid'].values, df['ask'].values)
+    df = df.loc[maxprices > 0]
     return df
 
 
-@_memory.cache
-def options_for_symbol(symbol, date=None):
-    calls, puts = yf.Ticker(symbol).option_chain(date=date)
+def _infer_underlying_curprice(calls, puts):
+    mask = calls['inTheMoney']
+    low = calls['strike'].loc[mask].max()
+    high = calls['strike'].loc[~mask].min()
 
-    return _clean_options_df(calls), _clean_options_df(puts)
+    mask = puts['inTheMoney']
+    put_high = puts['strike'].loc[mask].max()
+    put_low = puts['strike'].loc[~mask].min()
+
+    low = max(low, put_low)
+    high = min(high, put_high)
+    return (high + low) / 2
+
+
+@_memory.cache
+def options_for_symbol(symbol, date=None, curprice=None):
+    calls, puts = yf.Ticker(symbol).option_chain(date=date)
+    if curprice is None:
+        curprice = _infer_underlying_curprice(calls, puts)
+
+    calls, puts = _clean_options_df(calls), _clean_options_df(puts)
+
+    calls['breakeven_buy'] = calls['ask'] + calls['strike']
+    calls['breakeven_sell'] = calls['bid'] + calls['strike']
+    puts['breakeven_buy'] = puts['strike'] - puts['ask']
+    puts['breakeven_sell'] = puts['strike'] - puts['bid']
+
+    # sanity check yf prices
+    calls = calls.loc[calls['breakeven_buy'] >= curprice]
+    puts = puts.loc[puts['breakeven_sell'] <= curprice]
+
+    return calls, puts
 
 
 def load_history(sym, resolution='week', start_date=None):
@@ -722,8 +751,8 @@ def load_history(sym, resolution='week', start_date=None):
     return df
 
 
-def load_pdf(sym, resolution='day', window_len=1):
-    df = load_history(sym, resolution=resolution)
+def load_pdf(sym, resolution='day', window_len=1, start_date=None):
+    df = load_history(sym, resolution=resolution, start_date=start_date)
     assert window_len >= 1
     closes = df['Close'].values
     # if window_len == 1:
