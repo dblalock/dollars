@@ -21,6 +21,7 @@ _memory = Memory('.')
 # START_DATE = '2004-11-19'  # NOTE: has to be a trading day; 2004 to get GLD
 START_DATE = '2009-11-16'  # NOTE: has to be a trading day; 09-11-13 to get DG
 # START_DATE = '2002-09-03'  # NOTE: has to be a trading day
+END_DATE = '2020-05-01'  # fixed end to pretend all downloaded the same day
 
 HISTORIES_DIR = '../data/histories'
 
@@ -52,21 +53,32 @@ def _get_tickers_df():
     df1 = pd.read_csv('../data/otherlisted.txt', sep='|')
     df = pd.concat([df0, df1], axis=0, ignore_index=True, sort=False)
     df = df[['Symbol', 'Security Name']]
+    # df.drop_duplicates(subset=['Symbol'], keep='last', inplace=True)
+    df.rename(columns={'Security Name': 'Name'}, inplace=True)
+
+    lev_symbols = LEVERAGED_DF['LeveragedSymbol']
+    # lev_names = LEVERAGED_DF['Leverage'].map(lambda x: str(x))
+    lev_names = LEVERAGED_DF['Leverage'].astype('object')
+    lev_tickers_df = pd.DataFrame.from_dict({
+        'Symbol': lev_symbols, 'Name': lev_names})
+    df = pd.concat([lev_tickers_df, df], axis=0, ignore_index=True, sort=False)
+
     df.drop_duplicates(subset=['Symbol'], keep='last', inplace=True)
     df.sort_values(by='Symbol', axis=0, inplace=True)
-    df.rename(columns={'Security Name': 'Name'}, inplace=True)
 
     return df
 
 
-def all_symbols():
-    # return sorted(_get_tickers_df()['Symbol'])
-    return _get_tickers_df()['Symbol']
+# def all_symbols():
+#     # return sorted(_get_tickers_df()['Symbol'])
+#     ret = _get_tickers_df()['Symbol']
+#     return np.array(list(set(ret) + set(LEVERAGED_SYMBOLS)))
 
 
 def all_symbols_and_names():
     # return sorted(_get_tickers_df()['Symbol'])
-    return _get_tickers_df()
+    df = _get_tickers_df()
+    return df['Symbol'].values, df['Name'].values
 
 
 def _parse_iso_date(datestr):
@@ -89,7 +101,6 @@ def _check_symbol_relevant(sym, name='', sizeCutoffBytes=100e3,
     sym = sym.upper()
     cutoff_date = start_date and _parse_iso_date(start_date) or None
     blacklisted_phrases = _blacklisted_phrases()
-
     path = _history_path_for_symbol(sym)
 
     if sym in LEVERAGED_SYMBOLS:
@@ -148,13 +159,19 @@ def _check_symbol_relevant(sym, name='', sizeCutoffBytes=100e3,
 
 @_memory.cache
 def all_relevant_symbols(**kwargs):
-    df = all_symbols_and_names()
-    symbols, names = df['Symbol'], df['Name']
+    symbols, names = all_symbols_and_names()
     ret = []
+    # assert 'SDS' in symbols
+    # assert 'SPDN' in symbols
+    # assert _check_symbol_relevant('SDS', '-1', **kwargs)
+    # assert _check_symbol_relevant('SPDN', '-2', **kwargs)
+    # for sym, name in [['SDS', 'foo'], ['SPDN', 'foo']]:
     for sym, name in zip(symbols, names):
         print("checking symbol: ", sym)
         if _check_symbol_relevant(sym, name, **kwargs):
             ret.append(sym)  # found a decent one!
+    # assert 'SDS' in ret
+    # assert 'SPDN' in ret
     return ret
 
 
@@ -323,9 +340,9 @@ def _load_history_for_leveraged_symbol(symbol, start_date=START_DATE):
     symbol = symbol.upper()
     idx = np.where(
         LEVERAGED_DF['LeveragedSymbol'].str.upper() == symbol)[0][0]
-    print("idx: ", idx)
-    print("LEVERAGED_DF['Symbol'].values[idx]", LEVERAGED_DF['Symbol'].values[idx])
-    print("LEVERAGED_DF['Leverage'].values[idx]", LEVERAGED_DF['Leverage'].values[idx])
+    # print("idx: ", idx)
+    # print("LEVERAGED_DF['Symbol'].values[idx]", LEVERAGED_DF['Symbol'].values[idx])
+    # print("LEVERAGED_DF['Leverage'].values[idx]", LEVERAGED_DF['Leverage'].values[idx])
     tracks_symbol = LEVERAGED_DF['Symbol'].values[idx]
     leverage = float(LEVERAGED_DF['Leverage'].values[idx])
 
@@ -360,7 +377,10 @@ def _load_history_for_symbol(symbol, start_date=START_DATE, can_recurse=True):
     if can_recurse and symbol in LEVERAGED_SYMBOLS:
         return _load_history_for_leveraged_symbol(symbol, start_date=start_date)
 
-    df = pd.read_csv(_history_path_for_symbol(symbol))
+    path = _history_path_for_symbol(symbol)
+    if not os.path.exists(path):
+        _download_history_for_symbol(symbol)
+    df = pd.read_csv(path)
     df.fillna(inplace=True, axis=0, method='ffill')  # forward fill nans
 
     print("loading history for symbol: ", symbol)
@@ -391,6 +411,8 @@ def _load_history_for_symbol(symbol, start_date=START_DATE, can_recurse=True):
     df['relDay'] = closes / opens
     df['price'] = mathutils.compute_prices(closes, df['Dividends'].values)
 
+    df = df.loc[df['Date'] <= END_DATE]
+
     return df[['Date', 'Close', 'Dividends',
                'rel24h', 'relDay', 'price']]
 
@@ -403,7 +425,7 @@ def _load_monthly_history_for_symbol(symbol, start_date=START_DATE):
     df = dailydf.asfreq('M', method='ffill')
     df['maxClose'] = dailydf['Close'].resample('M').max()
     df['minClose'] = dailydf['Close'].resample('M').min()
-    df['relMonth'] = mathutils.compute_relative_changes(df['Close'].values)
+    df['relret'] = mathutils.compute_relative_changes(df['Close'].values)
     df.drop(['Date', 'rel24h', 'relDay', 'Dividends'], axis=1, inplace=True)
     return df
 
@@ -437,23 +459,10 @@ def _get_returns_daily_stds_df_for_symbol(sym, start_date):
         std24h=df['rel24h'].std())
 
 
-def _monthly_corr_with_qqq(df, start_date=START_DATE, col='relMonth'):
+def _monthly_corr_with_qqq(df, start_date=START_DATE, col='relret'):
     df0 = _load_monthly_history_for_symbol('QQQ', start_date=start_date)
     x, y = df[col].values.copy(), df0[col].values.copy()
-    x -= x.mean()
-    y -= y.mean()
-    x /= np.linalg.norm(x)
-    y /= np.linalg.norm(y)
-
-    # print("x, y")
-    # print(x[:12])
-    # print(y[:12])
-
-    return (x * y).sum()
-    # return np.corrcoef(df[col], df0[col])[0, 1]  # returns 2x2 matrix
-
-
-# def _lstsq_stats(returns, weights='sqrt'):
+    return mathutils.corr(x, y)
 
 
 def _get_monthly_stats_for_symbol(sym, start_date=START_DATE):
@@ -469,7 +478,7 @@ def _get_monthly_stats_for_symbol(sym, start_date=START_DATE):
 
     closes = df['Close']
     returns = df['Close'].values
-    relret = df['relMonth'].values.copy()
+    relret = df['relret'].values.copy()
     ret_total = returns[-1] / returns[0]
 
     timediff = df.index[-1] - df.index[0]
@@ -485,15 +494,15 @@ def _get_monthly_stats_for_symbol(sym, start_date=START_DATE):
     ret['24h'] = ret_total ** (1. / ndays)
     ret['monthly'] = ret_total ** (1. / nmonths)
     ret['annual'] = ret_total ** (1. / nyears)
-    ret['relMean'] = df['relMonth'].mean()  # arithmetic, not geometric
-    ret['relMedian'] = df['relMonth'].median()
+    ret['relMean'] = df['relret'].mean()  # arithmetic, not geometric
+    ret['relMedian'] = df['relret'].median()
 
     def _key_for_percentile(p):
         return 'monthlyRetPctile={:02d}'.format(p)
 
     # add in quantiles of returns across months
     percentiles = [1, 5, 10, 50, 90, 95, 99]
-    vals = np.percentile(df['relMonth'].values, percentiles)
+    vals = np.percentile(df['relret'].values, percentiles)
     for p, val in zip(percentiles, vals):
         ret[_key_for_percentile(p)] = val
 
@@ -524,11 +533,11 @@ def _get_monthly_stats_for_symbol(sym, start_date=START_DATE):
     # TODO add in some sort of weighted cagr that more heavily weights
     # recent returns
 
-    # mu = df['relMonth'].mean()
-    # diffs = df['relMonth'] - mu
+    # mu = df['relret'].mean()
+    # diffs = df['relret'] - mu
     # ret['pathEfficiency'] = mu / np.abs(diffs).mean()
     # ret['upwardFrac'] = mu / np.abs(diffs).mean()
-    # relret = df['relMonth'].values
+    # relret = df['relret'].values
     # diffs = relret[1:] - relret[:-
 
     # print("mu: ", mu)
@@ -549,7 +558,7 @@ def _get_monthly_stats_for_symbol(sym, start_date=START_DATE):
     # print("annual: ", ret['annual'])
 
     # "risk" metrics
-    neg_returns_mask = df['relMonth'] < 1
+    neg_returns_mask = df['relret'] < 1
     sharpe_denom = returns.std()
     sortino_denom = returns[neg_returns_mask].std()
     # ret['maxDrawdown'] = mathutils.maxdrawdown(returns)
@@ -577,8 +586,8 @@ def _get_monthly_stats_for_symbol(sym, start_date=START_DATE):
 
     ret['stableSharpe'] = (ret['cagrStable'] - RISK_FREE_RATE_MONTHLY) / sharpe_denom
     ret['stableSortino'] = (ret['cagrStable'] - RISK_FREE_RATE_MONTHLY) / sortino_denom
-    ret['stableQuad'] = ret['cagrStable'] - .55 * df['relMonth'].var()
-    ret['monthStd'] = df['relMonth'].std()
+    ret['stableQuad'] = ret['cagrStable'] - .55 * df['relret'].var()
+    ret['monthStd'] = df['relret'].std()
 
     # upward movement over total variation distance; on raw returns and log
     # returns; latter makes more sense / doesn't just focus on recent history
@@ -695,10 +704,12 @@ def load_master_df(start_date=None, dateCutoff=START_DATE, impute=False):
 
 def _clean_options_df(df):
     # df = df.loc[df['contractSize'] == 'REGULAR']
+    df = df.loc[(pd.to_datetime('today') - df['lastTradeDate']).astype('timedelta64[D]') < 10]
     df = df['strike lastPrice bid ask volume impliedVolatility inTheMoney'.split()]
     df.fillna(0, inplace=True)
     maxprices = np.maximum(df['bid'].values, df['ask'].values)
     df = df.loc[maxprices > 0]
+
     return df
 
 
@@ -719,6 +730,7 @@ def _infer_underlying_curprice(calls, puts):
 @_memory.cache
 def options_for_symbol(symbol, date=None, curprice=None):
     calls, puts = yf.Ticker(symbol).option_chain(date=date)
+    # print("calls.columns", calls.dtypes)
     if curprice is None:
         curprice = _infer_underlying_curprice(calls, puts)
 
@@ -736,13 +748,18 @@ def options_for_symbol(symbol, date=None, curprice=None):
     return calls, puts
 
 
+@_memory.cache
 def load_history(sym, resolution='week', start_date=None):
     if resolution == 'day':
         df = _load_history_for_symbol(sym, start_date=start_date)
+        df['relret'] = df['rel24h']
     elif resolution == 'week':
         df = _load_history_for_symbol(sym, start_date=start_date)
-        # df = dailydf.asfreq('M', method='ffill')
+        if df is None:
+            return None
         df = df.asfreq('W-SUN', method='ffill')
+        df['relret'] = mathutils.compute_relative_changes(df['Close'].values)
+        df.drop(['rel24h', 'relDay'], axis=1, inplace=True)
     elif resolution == 'month':
         df = _load_monthly_history_for_symbol(sym, start_date=start_date)
     else:
@@ -764,19 +781,142 @@ def load_pdf(sym, resolution='day', window_len=1, start_date=None):
     # return np.pow(2, series.rolling(duration_len).sum())
 
 
+@_memory.cache
+def find_correlations_with(sym='^GSPC', **history_kwargs):
+    history_kwargs.setdefault('start_date', '2011-01-04')
+
+    spydf = load_history(sym, **history_kwargs)
+    sym_returns = spydf['relret'].values
+    sym_returns_std = sym_returns.std()
+    # sym_returns_offset = sym_returns - 1
+    # sym_returns_normed = sym_returns_offset / np.linalg.norm(sym_returns_offset)  # noqa
+    # sym_returns_normed = sym_returns_offset / sym_returns_offset.std()
+    # sym_offset_returns = sym_returns - 1
+    # histlen = len(sym_closes)
+
+    # sym2corr = {}
+    syms = []
+    corrs = []
+    # minrets = []
+    # maxrets = []
+    stdratios = []
+    gapmins = []
+    gapmaxs = []
+    gapmeans = []
+    gapstds = []
+    gappct1s = []
+    gappct5s = []
+    gappct95s = []
+    gappct99s = []
+
+    # for s in ['IVV', 'SPY', 'VV']:
+    # for s in ['IVV', 'SPY', 'VV', 'SCHX']:
+    # for s in ['IVV', 'SPY', 'VV', 'SPDN', 'SDS']:
+    for s in all_relevant_symbols():
+        df = load_history(s, **history_kwargs)
+        if df is None:
+            continue
+
+        returns = df['relret'].values
+
+        corr = mathutils.corr(returns, sym_returns)
+        syms.append(s)
+        corrs.append(corr)
+
+        # offset_returns = returns - 1
+        # returns_normed = offset_returns / np.linalg.norm(offset_returns)
+        # returns_normed = offset_returns / offset_returns.std()
+        # std_ratio = sym_returns_std / returns.std()
+        # stdratios.append(1. / std_ratio)
+        std_ratio = np.round(returns.std() / sym_returns_std) * np.sign(corr)
+        # std_ratio *= np.sign(corr) or 1  # handle corr of exactly 0
+        stdratios.append(int(std_ratio))
+
+        scaled_returns = 1 + ((returns - 1) / (std_ratio + 1e-20))
+        # scaled_returns = returns
+        diffs = scaled_returns - sym_returns
+        # diffs = returns_normed - sym_returns_normed
+        gapmins.append(diffs.min())
+        gapmaxs.append(diffs.max())
+        gapmeans.append(diffs.mean())
+        gapstds.append(diffs.std())
+
+        vals = np.percentile(diffs, [1, 5, 95, 99])
+        gappct1s.append(vals[0])
+        gappct5s.append(vals[1])
+        gappct95s.append(vals[2])
+        gappct99s.append(vals[3])
+
+    return pd.DataFrame.from_dict({
+        'Symbol': syms, 'Corr': corrs, 'stdratio': stdratios,
+        'gapmins': gapmins, 'gapmaxs': gapmaxs,
+        'gapmeans': gapmeans, 'gapstds': gapstds,
+        'gappct5s': gappct5s, 'gappct95s': gappct95s,
+        'gappct1s': gappct1s, 'gappct99s': gappct99s,
+        })
 
 
 def main():
+    # print(LEVERAGED_DF['LeveragedSymbol'])
+    # print(LEVERAGED_DF['LeveragedSymbol'].isin(['SDS']))
+    # assert 'SDS' in list(LEVERAGED_DF['LeveragedSymbol'].values)
 
+    # df = _get_tickers_df()
+    # assert 'SDS' in df['Symbol'].values
+    # return
+
+
+    # # syms = all_symbols_and_names()['Symbol'].values
+    # # syms, _ = all_symbols_and_names()
+    # syms = all_relevant_symbols()
+    # assert 'SDS' in syms
+    # assert 'SPDN' in syms
+    # print("has stuff I want: ", 'SPDN' in list(syms), 'SDS' in list(syms))
+    # # print("list has stuff I want: ", 'SPDN' in LEVERAGED_SYMBOLS, 'SDS' in LEVERAGED_SYMBOLS)
+    # print(_check_symbol_relevant('SPDN'))
+    # print(_check_symbol_relevant('SDS'))
+    # return
+
+    # spydf = load_history('^GSPC', resolution='week', start_date=None)
+    # spydf = load_history('SPY', resolution='week', start_date='2011-01-04')
+    # return
+
+
+    # TODO figure out not just corr, but stats about distro of
+    # movements together for options arbitrage
+
+
+
+    # df = find_correlations_with('^GSPC')
+    # df = find_correlations_with('SPY')
+    # df = find_correlations_with('^NDX')
+    df = find_correlations_with('QQQ')
+    # print(sym2corr.head())
+    df['abscorr'] = np.abs(df['Corr'])
+    df = df.sort_values('abscorr', ascending=False, axis=0)
+    df = df.loc[df['abscorr'] > .98]
+    df['gapmins'] *= 100  # pct easier to read
+    df['gapmaxs'] *= 100  # pct easier to read
+    df['gapmeans'] *= 100  # pct easier to read
+    df['gapstds'] *= 100  # pct easier to read
+    df['gappct1s'] *= 100  # pct easier to read
+    df['gappct5s'] *= 100  # pct easier to read
+    df['gappct95s'] *= 100  # pct easier to read
+    df['gappct99s'] *= 100  # pct easier to read
+    # df = df.loc[df['']
+    print(df.shape)
+    print(df)
+    return
 
     # # rets = load_pdf('tqqq', resolution='day')
     # # sym = 'tqqq'
     # # calls, puts = yf.Ticker('spy').option_chain(date='2020-06-19')
-    # # calls, puts = options_for_symbol('spy', '2020-06-18')
-    # calls, puts = options_for_symbol('spxl', '2020-06-18')
+    # calls, puts = options_for_symbol('spy', '2020-06-18')
+    # # calls, puts = options_for_symbol('tqqq', '2020-06-18')
+    # # calls, puts = options_for_symbol('tqqq', '2022-01-20')
     # print("calls cols: ", calls.columns)
     # # calls = calls[[strike]]
-    # print(calls)
+    # print(calls.shape)
     # return
 
     # # download_100y_old_histories()

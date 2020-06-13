@@ -4,6 +4,7 @@ import collections
 import pandas as pd
 import numpy as np
 from joblib import Memory
+import torch
 
 import history
 
@@ -315,15 +316,15 @@ def compute_option_returns(sym, date, rets, curprice=None):
         print('------------------------ buy', sym, name, date)
         keys = ('strike bid ask breakeven_buy relvalue value'.split() +
                 'value_buy relret_buy adjret_buy'.split())
-        use_df = df.loc[(df['relret_buy'] > 1) & df['relret_buy'].notnull()]
-        # use_df = df.loc[df['relret_buy'].notnull()]
+        # use_df = df.loc[(df['relret_buy'] > 1) & df['relret_buy'].notnull()]
+        use_df = df.loc[df['relret_buy'].notnull()]
         print(use_df[keys].head(25))
         print(use_df[keys].tail(58))
         print('------------------------ sell', sym, name, date)
         keys = ('strike bid ask breakeven_sell relvalue value'.split() +
                 'value_sell relret_sell adjret_sell'.split())
-        use_df = df.loc[(df['relret_sell'] > 1) & df['relret_sell'].notnull()]
-        # use_df = df.loc[df['relret_sell'].notnull()]
+        # use_df = df.loc[(df['relret_sell'] > 1) & df['relret_sell'].notnull()]
+        use_df = df.loc[df['relret_sell'].notnull()]
         print(use_df[keys].head(25))
         print(use_df[keys].tail(58))
 
@@ -361,7 +362,11 @@ def optimize_option_returns(sym, date, samples, curprice=None):
 
     # print(puts.shape)
     # return
-    puts = puts.head(65)
+    if sym.upper() == 'TQQQ' and date.startswith('2022'):
+        puts = puts.head(65)
+        calls = calls.loc[calls['strike'] != 97]  # crap data # TODO rm
+        puts = puts.loc[~(puts['strike'].isin([101, 107, 108, 109, 113]))]  # crap data # TODO rm
+        puts = puts.loc[puts['strike'] < 145]  # crap data # TODO rm
 
     outcomearrays = _compute_individual_option_returns(
         calls, puts, curprice, samples)
@@ -446,7 +451,97 @@ def debug_optimize_options(sym, date, samples, curprice=None):
     print("nsamples: ", len(samples))
 
 
-def main():
+
+def _maximin_ratio(outcomes0, outcomes_minratio, outcomes_maxratio,
+                   lamda0=1, niters=100):
+    """find a ratio lamda such that
+            min((outcomes0 + lamda * outcomes_minratio).min(),
+                (outcomes0 + lamda * outcomes_maxratio).min())
+        is maximized
+    """
+
+    lamda = torch.tensor(lamda0, requires_grad=True)
+
+    x0 = torch.tensor(outcomes0)
+    xa = torch.tensor(outcomes_minratio)
+    xb = torch.tensor(outcomes_maxratio)
+
+    opt = torch.optim.SGD([lamda], .1, momentum=.9)
+
+    for t in range(niters):
+        totals_a = x0 + lamda * xa
+        totals_b = x0 + lamda * xb
+        worst = torch.min(totals_a, totals_b).min()
+        # worst_a = totals_a.min()
+        # worst_b = totals_b.min()
+        # loss = -torch.min(worst_a, worst_b)
+        loss = -worst
+        loss.backward()
+        opt.step()
+        opt.zero_grad()
+
+    return lamda, -loss  # lowest possible return
+
+
+def i_can_haz_arbitrage(op0, op1, minrelratio, maxrelratio, samples=None):
+    """
+    args:
+        op0, op1: OptionOrder objects
+        minrelratio, maxrelratio: if the underlying of op0 changes by a factor
+        of alpha relative to current price, the underlying of op1 is assumed
+        to change by a factor beta, such that
+            `minrelratio*alpha <= beta <= maxrelratio*alpha`
+        samples: array of relative changes in price of op0 underlying on which
+            to compute the returns
+    """
+
+    if samples is None:
+        samples = np.linspace(-.25, .25, 500)  # +/- 25% in steps of .1%
+
+    # for each relative change in op0, compute smallest and largest relative
+    # change in op1
+    op0_samples = samples
+    op1_minsamples = samples * minrelratio
+    op1_maxsamples = samples * maxrelratio
+
+    outcomes0 = reloutcomes_of_option(op0, op0_samples)
+    outcomes1min = reloutcomes_of_option(op1, op1_minsamples)
+    outcomes1max = reloutcomes_of_option(op1, op1_maxsamples)
+
+    lamda, lowest = _maximin_ratio(outcomes0, outcomes1min, outcomes1max)
+    if lowest < 1.00001:
+        return lowest, 0
+
+    # TODO allow stuff like 3:2 ratios, instead of just N:1 or 1:N
+    if lamda < 1:
+        lamdalow = 1. / np.floor(1. / lamda)
+        lamdahigh = 1. / np.ceil(1. / lamda)
+    else:
+        lamdalow = np.floor(1. / lamda)
+        lamdahigh = np.floor(1. / lamda)
+
+    totals_a = outcomes0 + lamdalow * outcomes1min
+    totals_b = outcomes0 + lamdalow * outcomes1max
+    worstlow = np.minimum(totals_a, totals_b).min()
+
+    totals_a = outcomes0 + lamdahigh * outcomes1min
+    totals_b = outcomes0 + lamdahigh * outcomes1max
+    worsthigh = np.minimum(totals_a, totals_b).min()
+
+    ret = max(worstlow, worsthigh)
+    if ret < 1:
+        return ret, 0
+    retlamda = lamdalow if worstlow > worsthigh else lamdahigh
+
+    return ret, retlamda
+
+
+
+
+# TODO pick up here by finding stuff that's super correlated and checking
+# for option arbitrage opportunities (or at least really good deals)
+
+def main_optimize_returns():
     sym = 'tqqq'
     # sym = 'spy'
     # sym = 'qqq'
@@ -460,21 +555,45 @@ def main():
     # option_date = '2020-06-18'
 
     start_date = '2002-01-04' if sym.endswith('qqq') else None
-    rets = history.load_pdf(sym, resolution=resolution, window_len=window_len, start_date=start_date)
-    # rets = np.array([1, 2, 2])
-
-    # outcomearrays = _compute_individual_option_returns()
-
-    # debug_optimize_options(sym, date=option_date, samples=rets, curprice=None)
-    # return
-
-    # compute_option_returns(sym, date=option_date, rets=rets, curprice=None)
-    # return
+    rets = history.load_pdf(sym, resolution=resolution,
+                            window_len=window_len, start_date=start_date)
 
     keys, score, outcomes = optimize_option_returns(sym, date=option_date, samples=rets, curprice=None)
     print(keys, score)
     print("outcomes.mean(), outcomes.std(), outcomes.min(), outcomes.max()")
     print(outcomes.mean(), outcomes.std(), outcomes.min(), outcomes.max())
+
+
+def main_compute_returns():
+    sym = 'tqqq'
+    # sym = 'spy'
+    # sym = 'qqq'
+
+    resolution = 'month'
+    window_len = 18
+    option_date = '2022-01-20'
+
+    # resolution = 'day'
+    # window_len = 10
+    # option_date = '2020-06-18'
+
+    start_date = '2002-01-04' if sym.endswith('qqq') else None
+    rets = history.load_pdf(sym, resolution=resolution,
+                            window_len=window_len, start_date=start_date)
+
+    compute_option_returns(sym, date=option_date, rets=rets, curprice=None)
+
+
+def main_arbitrage():
+    sym = 'tqqq'
+    # sym = 'spy'
+    # sym = 'qqq'
+
+
+def main():
+    # main_compute_returns()
+    # main_optimize_returns()
+    main_arbitrage()
 
 
     # print(calls.shape)

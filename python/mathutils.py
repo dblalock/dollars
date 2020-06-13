@@ -125,6 +125,16 @@ def covmat(X):
     return X.T @ X
 
 
+def corr(x, y):
+    # return np.corrcoef(df[col], df0[col])[0, 1]  # returns 2x2 matrix
+    x = x - x.mean()
+    y = y - y.mean()
+    x /= np.linalg.norm(x)
+    y /= np.linalg.norm(y)
+
+    return (x * y).sum()
+
+
 def l1_project(v, target_l1_norm=1):
     # XXX this won't make v bigger, only smaller
     # also, not actually projecting onto nearest point on L1 ball; just zeroing
