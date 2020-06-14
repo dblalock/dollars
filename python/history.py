@@ -242,7 +242,8 @@ def load_info(sym):
 
 
 def download_histories():
-    for symbol in all_symbols():
+    symbols, _ = all_symbols_and_names()
+    for symbol in symbols:
         _download_history_for_symbol(symbol)
 
 
@@ -702,51 +703,6 @@ def load_master_df(start_date=None, dateCutoff=START_DATE, impute=False):
     return df
 
 
-def _clean_options_df(df):
-    # df = df.loc[df['contractSize'] == 'REGULAR']
-    df = df.loc[(pd.to_datetime('today') - df['lastTradeDate']).astype('timedelta64[D]') < 10]
-    df = df['strike lastPrice bid ask volume impliedVolatility inTheMoney'.split()]
-    df.fillna(0, inplace=True)
-    maxprices = np.maximum(df['bid'].values, df['ask'].values)
-    df = df.loc[maxprices > 0]
-
-    return df
-
-
-def _infer_underlying_curprice(calls, puts):
-    mask = calls['inTheMoney']
-    low = calls['strike'].loc[mask].max()
-    high = calls['strike'].loc[~mask].min()
-
-    mask = puts['inTheMoney']
-    put_high = puts['strike'].loc[mask].max()
-    put_low = puts['strike'].loc[~mask].min()
-
-    low = max(low, put_low)
-    high = min(high, put_high)
-    return (high + low) / 2
-
-
-@_memory.cache
-def options_for_symbol(symbol, date=None, curprice=None):
-    calls, puts = yf.Ticker(symbol).option_chain(date=date)
-    # print("calls.columns", calls.dtypes)
-    if curprice is None:
-        curprice = _infer_underlying_curprice(calls, puts)
-
-    calls, puts = _clean_options_df(calls), _clean_options_df(puts)
-
-    calls['breakeven_buy'] = calls['ask'] + calls['strike']
-    calls['breakeven_sell'] = calls['bid'] + calls['strike']
-    puts['breakeven_buy'] = puts['strike'] - puts['ask']
-    puts['breakeven_sell'] = puts['strike'] - puts['bid']
-
-    # sanity check yf prices
-    calls = calls.loc[calls['breakeven_buy'] >= curprice]
-    puts = puts.loc[puts['breakeven_sell'] <= curprice]
-
-    return calls, puts
-
 
 @_memory.cache
 def load_history(sym, resolution='week', start_date=None):
@@ -782,7 +738,8 @@ def load_pdf(sym, resolution='day', window_len=1, start_date=None):
 
 
 @_memory.cache
-def find_correlations_with(sym='^GSPC', **history_kwargs):
+def find_correlations_with(sym='^GSPC', abscorrthresh=.98, int_stdratio=True,
+                           **history_kwargs):
     history_kwargs.setdefault('start_date', '2011-01-04')
 
     spydf = load_history(sym, **history_kwargs)
@@ -820,6 +777,9 @@ def find_correlations_with(sym='^GSPC', **history_kwargs):
         returns = df['relret'].values
 
         corr = mathutils.corr(returns, sym_returns)
+        if np.abs(corr) < abscorrthresh:
+            continue
+
         syms.append(s)
         corrs.append(corr)
 
@@ -828,9 +788,12 @@ def find_correlations_with(sym='^GSPC', **history_kwargs):
         # returns_normed = offset_returns / offset_returns.std()
         # std_ratio = sym_returns_std / returns.std()
         # stdratios.append(1. / std_ratio)
-        std_ratio = np.round(returns.std() / sym_returns_std) * np.sign(corr)
+        std_ratio = (returns.std() / sym_returns_std) * np.sign(corr)
+        if int_stdratio:
+            std_ratio = int(np.round(std_ratio))
         # std_ratio *= np.sign(corr) or 1  # handle corr of exactly 0
-        stdratios.append(int(std_ratio))
+        # stdratios.append(int(std_ratio))
+        stdratios.append(std_ratio)
 
         scaled_returns = 1 + ((returns - 1) / (std_ratio + 1e-20))
         # scaled_returns = returns
@@ -847,16 +810,52 @@ def find_correlations_with(sym='^GSPC', **history_kwargs):
         gappct95s.append(vals[2])
         gappct99s.append(vals[3])
 
-    return pd.DataFrame.from_dict({
-        'Symbol': syms, 'Corr': corrs, 'stdratio': stdratios,
-        'gapmins': gapmins, 'gapmaxs': gapmaxs,
-        'gapmeans': gapmeans, 'gapstds': gapstds,
-        'gappct5s': gappct5s, 'gappct95s': gappct95s,
-        'gappct1s': gappct1s, 'gappct99s': gappct99s,
+    df = pd.DataFrame.from_dict({
+        'Symbol': syms, 'corr': corrs, 'stdratio': stdratios,
+        'gapmin': gapmins, 'gapmax': gapmaxs,
+        'gapmean': gapmeans, 'gapstd': gapstds,
+        'gap05%': gappct5s, 'gap95%': gappct95s,
+        'gap01%': gappct1s, 'gap99%': gappct99s,
         })
+    df['abscorr'] = np.abs(df['corr'])
+    df = df.sort_values('abscorr', ascending=False, axis=0)
+    return df
+
+
+def main_corrs():
+    # df = find_correlations_with('^GSPC')
+    # df = find_correlations_with('^NDX')
+    df = find_correlations_with('SPY', abscorrthresh=.99)
+    # df = find_correlations_with('QQQ')
+    # df = find_correlations_with('TQQQ', abscorrthresh=.98, int_stdratio=False)
+    # df = find_correlations_with('DIA')
+    # df = find_correlations_with('IAU')
+    # df = find_correlations_with('^RUT')
+    # df = find_correlations_with('IWO')
+    # df = find_correlations_with('VTI')
+    # df = find_correlations_with('IEFA')  # no data for some reason...
+    # df = find_correlations_with('VWO')
+    # print(sym2corr.head())
+    # df['abscorr'] = np.abs(df['Corr'])
+    # df = df.sort_values('abscorr', ascending=False, axis=0)
+    # df = df.loc[df['abscorr'] > .98]
+    df['gapmin'] *= 100  # pct easier to read
+    df['gapmax'] *= 100  # pct easier to read
+    df['gapmean'] *= 100  # pct easier to read
+    df['gapstd'] *= 100  # pct easier to read
+    df['gap01%'] *= 100  # pct easier to read
+    df['gap05%'] *= 100  # pct easier to read
+    df['gap95%'] *= 100  # pct easier to read
+    df['gap99%'] *= 100  # pct easier to read
+    # df = df.loc[df['']
+    print(df.shape)
+    print(df)
 
 
 def main():
+    main_corrs()
+    return
+
     # print(LEVERAGED_DF['LeveragedSymbol'])
     # print(LEVERAGED_DF['LeveragedSymbol'].isin(['SDS']))
     # assert 'SDS' in list(LEVERAGED_DF['LeveragedSymbol'].values)
@@ -879,44 +878,6 @@ def main():
 
     # spydf = load_history('^GSPC', resolution='week', start_date=None)
     # spydf = load_history('SPY', resolution='week', start_date='2011-01-04')
-    # return
-
-
-    # TODO figure out not just corr, but stats about distro of
-    # movements together for options arbitrage
-
-
-
-    # df = find_correlations_with('^GSPC')
-    # df = find_correlations_with('SPY')
-    # df = find_correlations_with('^NDX')
-    df = find_correlations_with('QQQ')
-    # print(sym2corr.head())
-    df['abscorr'] = np.abs(df['Corr'])
-    df = df.sort_values('abscorr', ascending=False, axis=0)
-    df = df.loc[df['abscorr'] > .98]
-    df['gapmins'] *= 100  # pct easier to read
-    df['gapmaxs'] *= 100  # pct easier to read
-    df['gapmeans'] *= 100  # pct easier to read
-    df['gapstds'] *= 100  # pct easier to read
-    df['gappct1s'] *= 100  # pct easier to read
-    df['gappct5s'] *= 100  # pct easier to read
-    df['gappct95s'] *= 100  # pct easier to read
-    df['gappct99s'] *= 100  # pct easier to read
-    # df = df.loc[df['']
-    print(df.shape)
-    print(df)
-    return
-
-    # # rets = load_pdf('tqqq', resolution='day')
-    # # sym = 'tqqq'
-    # # calls, puts = yf.Ticker('spy').option_chain(date='2020-06-19')
-    # calls, puts = options_for_symbol('spy', '2020-06-18')
-    # # calls, puts = options_for_symbol('tqqq', '2020-06-18')
-    # # calls, puts = options_for_symbol('tqqq', '2022-01-20')
-    # print("calls cols: ", calls.columns)
-    # # calls = calls[[strike]]
-    # print(calls.shape)
     # return
 
     # # download_100y_old_histories()

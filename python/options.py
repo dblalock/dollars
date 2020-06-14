@@ -5,10 +5,11 @@ import pandas as pd
 import numpy as np
 from joblib import Memory
 import torch
+import yfinance as yf
 
 import history
 
-_memory = Memory('.')
+_memory = Memory('.', verbose=1)
 
 
 class OptionOrder(collections.namedtuple(
@@ -26,6 +27,9 @@ def reloutcomes_of_option(order, samples, addtobuff=None):
     assert optype in ('call', 'put')
     ordertype = order.ordertype
     assert ordertype in ('buy', 'sell')
+
+    # print("samples, dtype: ", samples, type(samples))
+    # print("strike, dtype: ", strike, type(strike))
 
     if optype == 'call':
         mask = samples > strike
@@ -203,7 +207,7 @@ def relvalue_of_put(relstrike, samples, relprice=0):
     return np.maximum(0, relstrike - samples).mean() - (relprice or 0)
 
 
-# def _infer_underlying_curprice(calls, puts):
+# def infer_underlying_curprice(calls, puts):
 #     mask = calls['inTheMoney']
 #     low = calls['strike'].loc[mask].max()
 #     high = calls['strike'].loc[~mask].min()
@@ -251,9 +255,9 @@ def _compute_put_relvalues(strikes, rets, curprice=1., prices=None):
 
 
 def compute_option_returns(sym, date, rets, curprice=None):
-    calls, puts = history.options_for_symbol(sym, date)
+    calls, puts, bid, ask = options_for_symbol(sym, date)
     if curprice is None:
-        curprice = history._infer_underlying_curprice(calls, puts)
+        curprice = infer_underlying_curprice(calls, puts)
 
     # calls['breakeven_buy'] = calls['ask'] + calls['strike']
     # puts['breakeven_s'] = puts['strike'] - puts['price']
@@ -332,7 +336,13 @@ def compute_option_returns(sym, date, rets, curprice=None):
 
 
 @_memory.cache
-def _compute_individual_option_returns(calls, puts, curprice, samples):
+def _compute_individual_option_returns(calls, puts, curprice, samples,
+                                       gap_lb=None, gap_ub=None):
+
+    use_gaps = gap_lb is not None or gap_ub is not None
+    if use_gaps:
+        assert gap_lb is not None and gap_ub is not None
+
     # just support pairs of options for now
     outcomearrays = {}
     all_zeros = np.zeros_like(samples)
@@ -346,19 +356,20 @@ def _compute_individual_option_returns(calls, puts, curprice, samples):
                 optorder = optionorder_from_idx(
                     df, curprice, i,
                     optiontype=optype, ordertype=ordertype)
-                outcomearrays[key] = optorder, reloutcomes_of_option(
-                    optorder, samples)
-                # outcomearrays[key] = reloutcomes_of_option_at_idx(
-                #     df=df, curprice=curprice, idx=i, optiontype=optype,
-                #     ordertype=ordertype, samples=samples)
+                if use_gaps:
+                    outcomes = worst_reloutcomes_of_option(
+                        optorder, samples, gap_lb, gap_ub)
+                else:
+                    outcomes = reloutcomes_of_option(optorder, samples)
+                outcomearrays[key] = optorder, outcomes
 
     return outcomearrays
 
 
 def optimize_option_returns(sym, date, samples, curprice=None):
-    calls, puts = history.options_for_symbol(sym, date)
+    calls, puts, bid, ask = options_for_symbol(sym, date)
     if curprice is None:
-        curprice = history._infer_underlying_curprice(calls, puts)
+        curprice = infer_underlying_curprice(calls, puts)
 
     # print(puts.shape)
     # return
@@ -429,29 +440,7 @@ def optimize_option_returns(sym, date, samples, curprice=None):
     #         #     for ll in range(nputs):
 
 
-def debug_optimize_options(sym, date, samples, curprice=None):
-    calls, puts = history.options_for_symbol(sym, date)
-    if curprice is None:
-        curprice = history._infer_underlying_curprice(calls, puts)
-
-    # print(puts.shape)
-    # return
-    puts = puts.head(65)
-
-    outcomearrays = _compute_individual_option_returns(
-        calls, puts, curprice, samples)
-
-    outcomes = outcomearrays[('call', 'buy', 175)]
-    print("outcomes: ")
-    print(outcomes[:20])
-    print(outcomes[-20:])
-    print("samples")
-    print(samples[:20])
-    print(samples[-20:])
-    print("nsamples: ", len(samples))
-
-
-
+# this function is unused, since we actually assume we know the ratio a priori
 def _maximin_ratio(outcomes0, outcomes_minratio, outcomes_maxratio,
                    lamda0=1, niters=100):
     """find a ratio lamda such that
@@ -483,6 +472,7 @@ def _maximin_ratio(outcomes0, outcomes_minratio, outcomes_maxratio,
     return lamda, -loss  # lowest possible return
 
 
+# this function is unused; was just a prototype
 def i_can_haz_arbitrage(op0, op1, minrelratio, maxrelratio, samples=None):
     """
     args:
@@ -536,11 +526,6 @@ def i_can_haz_arbitrage(op0, op1, minrelratio, maxrelratio, samples=None):
     return ret, retlamda
 
 
-
-
-# TODO pick up here by finding stuff that's super correlated and checking
-# for option arbitrage opportunities (or at least really good deals)
-
 def main_optimize_returns():
     sym = 'tqqq'
     # sym = 'spy'
@@ -584,16 +569,300 @@ def main_compute_returns():
     compute_option_returns(sym, date=option_date, rets=rets, curprice=None)
 
 
+def infer_underlying_curprice(calls, puts):
+    mask = calls['inTheMoney'].values
+    low = calls['strike'].loc[mask].max()
+    high = calls['strike'].loc[~mask].min()
+    low = 0 if np.isnan(low) else low
+    high = np.inf if np.isnan(high) else high
+
+    mask = puts['inTheMoney'].values
+    # print("mask", mask)
+    put_low = puts['strike'].loc[~mask].max()
+    put_high = puts['strike'].loc[mask].min()
+    put_low = 0 if np.isnan(put_low) else put_low
+    put_high = np.inf if np.isnan(put_high) else put_high
+
+    # print("low, put low", low, put_low)
+    low = max(low, put_low)
+    high = min(high, put_high)
+    # print("low, high", low, high)
+    return (high + low) / 2
+
+
+def _clean_options_df(df):
+    # df = df.loc[df['contractSize'] == 'REGULAR']
+    df = df.loc[(pd.to_datetime('today') - df['lastTradeDate']).astype('timedelta64[D]') < 10]
+    df = df['strike lastPrice bid ask volume impliedVolatility inTheMoney'.split()]
+    df.fillna(0, inplace=True)
+    maxprices = np.maximum(df['bid'].values, df['ask'].values)
+    df = df.loc[maxprices > 0]
+
+    return df
+
+
+def _normalize_options(df, bid, ask, is_call):
+    # calls use bid since determines if you can make a profit calling the
+    # shares from someone and selling them;
+    # puts use ask since determines if you can make a profit buying the
+    # shares and putting them on someone
+    df = df.copy()
+    df['strike'] /= (bid if is_call else ask)
+    df['bid'] /= bid
+    df['ask'] /= ask
+    df['breakeven_buy'] /= (bid if is_call else ask)
+    df['breakeven_sell'] /= (ask if is_call else bid)
+    df['lastPrice'] /= (bid if is_call else ask)
+    return df
+
+
+def normalize_options(calls, puts, bid, ask):
+    calls = _normalize_options(calls, bid, ask, is_call=True)
+    puts = _normalize_options(puts, bid, ask, is_call=False)
+    return calls, puts
+
+
+@_memory.cache
+def options_for_symbol(symbol, date=None, curprice=None, normalize=False):
+    ticker = yf.Ticker(symbol)
+    calls, puts = ticker.option_chain(date=date)
+    # print("calls.columns", calls.dtypes)
+    if curprice is None:
+        curprice = infer_underlying_curprice(calls, puts)
+
+    calls, puts = _clean_options_df(calls), _clean_options_df(puts)
+
+    calls['breakeven_buy'] = calls['ask'] + calls['strike']
+    calls['breakeven_sell'] = calls['bid'] + calls['strike']
+    puts['breakeven_buy'] = puts['strike'] - puts['ask']
+    puts['breakeven_sell'] = puts['strike'] - puts['bid']
+
+    # sanity check yf prices
+    calls = calls.loc[calls['breakeven_buy'] >= curprice]
+    puts = puts.loc[puts['breakeven_sell'] <= curprice]
+
+    info = ticker.info
+    bid, ask = info['bid'], info['ask']
+
+    if normalize:
+        calls, puts = normalize_options(calls, puts, bid, ask)
+
+    return calls, puts, bid, ask
+
+
+def worst_reloutcomes_of_option(order, samples, gap_lb, gap_ub):
+    assert gap_ub >= gap_lb
+
+    samples1_lb = samples + gap_lb
+    samples1_ub = samples + gap_ub
+    outcomes1_noiseless = reloutcomes_of_option(order, samples)
+    outcomes1_lb = reloutcomes_of_option(order, samples1_lb)
+    outcomes1_ub = reloutcomes_of_option(order, samples1_ub)
+
+    outcomes1 = np.minimum(outcomes1_lb, outcomes1_ub)
+    return np.minimum(outcomes1, outcomes1_noiseless)
+
+
+# def _check_arbitrage_one_pair(order0, order1, stats, samples):
+# def _min_return_one_pair(order0, order1, samples,
+#                          stdratio, gap_lb, gap_ub):
+
+
+#     outcomes0 = reloutcomes_of_option(order0, samples)
+
+#     # the tricky part of this is taking into account when the underlying of
+#     # order1 deviates from mirroring the underlying of order0
+#     samples1 = 1 + ((samples - 1) * stdratio)
+
+
+#     outcomes = outcomes0 + outcomes1
+#     return outcomes.min()
+
+
+def check_arbitrage(stats, calls0, puts0, calls, puts,
+                    no_put_sells=True, samples0=None, samples1=None,
+                    gaps='1%'):
+    # NOTE: this assumes that all the options dfs have already been normalized
+    # (as if current price of underlying in both cases were 1)
+
+    if samples0 is None:
+        samples0 = 1 + np.linspace(-.25, .25, 500)  # +/- 25% in steps of .1%
+
+    # print("dtypes", calls0.dtypes, puts0.dtypes)
+    # import sys; sys.exit()
+
+    outcomearrays0 = _compute_individual_option_returns(
+        calls0, puts0, curprice=1, samples=samples0)
+
+    stdratio = float(stats['stdratio'])
+
+    # the tricky part of this is taking into account when the underlying of
+    # order1 deviates from mirroring the underlying of order0
+    if samples1 is None:
+        # TODO use actual histories for both of these
+        samples1 = 1 + ((samples0 - 1) * stdratio)
+
+    if gaps is None:
+        gaps_lb = None
+        gaps_ub = None
+    elif gaps == '1%':
+        gap_lb = stats['gap01%']
+        gap_ub = stats['gap99%']
+    elif gaps == '5%':
+        gap_lb = stats['gap05%']
+        gap_ub = stats['gap95%']
+    elif gaps == 'worst':
+        gap_lb = stats['gapmin']
+        gap_ub = stats['gapmax']
+    elif hasattr(gaps, '__len__') and len(gaps) == 2:
+        gaps_lb, gaps_ub = gaps
+    else:
+        raise ValueError(f"Unrecognized gaps option: '{gaps}'")
+
+    outcomearrays1 = _compute_individual_option_returns(
+        calls, puts, curprice=1, samples=samples1,
+        gap_lb=gap_lb, gap_ub=gap_ub)
+
+    opposite_optype = {'call': 'put', 'put': 'call'}
+
+    best_keys = (-1, -1)  # no options at all
+    best_score = 0
+    best_outcomes = np.zeros_like(samples0)
+
+    for k0 in outcomearrays0:
+        order0, outcomes0 = outcomearrays0[k0]
+        ortype0 = order0.ordertype
+        optype0 = order0.optiontype
+        skip = (no_put_sells and ortype0 == 'sell' and
+                order0.optiontype == 'put')
+        if skip:
+            continue
+
+        strike0 = order0.relstrike
+        for k1 in outcomearrays1:
+            # order1, outcomes1 = outcomearrays1[k1]
+            tmp = outcomearrays1[k1]
+            # print(tmp[0])
+            # print(tmp[1])
+            try:
+                order1, outcomes1 = tmp
+            except IndexError:
+                print(tmp)
+                import sys; sys.exit()
+            # print(tmp[2])
+
+
+            # ------------------------ skip this comparison if possible
+            ortype1 = order1.ordertype
+            if ortype1 == ortype0:
+                continue  # need to buy one and sell the other
+
+            optype1 = order1.optiontype
+            target_optype = (optype0 if stdratio > 0
+                             else opposite_optype[optype0])
+            if optype1 != target_optype:
+                continue  # bull/bear directions need to be aligned
+
+            strike1 = order1.relstrike
+            if np.abs(strike0 - strike1) >= .05:
+                continue  # too far apart, has interval where we can lose
+
+            # ------------------------ actually check for arbitrage
+
+            outcomes = outcomes0 + (np.abs(stdratio) * outcomes1)
+            score = outcomes.min()
+            # score = outcomes.mean()
+            if score > best_score:
+                best_score = score
+                best_keys = (k0, k1)
+                best_outcomes = outcomes.copy()
+
+    return best_keys, best_score, best_outcomes
+
+
 def main_arbitrage():
-    sym = 'tqqq'
+    # sym = 'tqqq'
     # sym = 'spy'
-    # sym = 'qqq'
+    sym = 'qqq'
+    options_date = '2020-06-18'
+
+    # stats_df = history.find_correlations_with('SPY', abscorrthresh=.99)
+    stats_df = history.find_correlations_with(sym, abscorrthresh=.98)
+    # stats_df.index = stats_df['Symbol']
+    stats_df.set_index(stats_df['Symbol'], inplace=True)
+
+    calls0, puts0, bid, ask = options_for_symbol(
+        sym, date=options_date, normalize=True)
+    # curprice0 = infer_underlying_curprice(calls0, puts0)
+    # calls0 = normalize_options(calls0, curprice0)
+    # puts0 = normalize_options(puts0, curprice0)
+
+    hist0 = history.load_history(sym, resolution='week')
+
+    solutions = []
+    for s in stats_df['Symbol'].values:
+        try:
+            calls, puts, bid, ask = options_for_symbol(
+                s, date=options_date, normalize=True)
+        except IndexError:
+            continue  # yfinance failed at downloading the options
+        # curprice = infer_underlying_curprice(calls, puts)
+
+        print("s, curprice: ", s, bid)
+
+        # calls = normalize_options(calls, curprice)
+        # puts = normalize_options(puts, curprice)
+
+        stats = stats_df.loc[s]
+        # print(stats)
+
+        hist1 = history.load_history(s, resolution='week')
+
+        # TODO use actual histories / pdfs as samples
+
+        keys, score, best_outcomes = check_arbitrage(
+            stats, calls0, puts0, calls, puts)
+            # stats, calls0, puts0, calls, puts,
+            # samples0=hist0, samples1=hist1)
+        if score > 0:
+            k0, k1 = keys
+            opt0 = [sym, *k0[:2], np.round(k0[2] * bid * 2) / 2]
+            opt1 = [s, *k1[:2], np.round(k1[2] * bid * 2) / 2]
+            solutions.append((opt0, opt1, score, best_outcomes.mean()))
+            # solutions.append((sym, s, keys, score, best_outcomes))
+
+    # print(solutions)
+    # sym_s_key_score_list = [soln[:4] for soln in solutions]
+    import pprint
+    pprint.pprint(solutions)
+    # pprint.pprint(sym_s_key_score_list)
+    # sym_s_key_score_list = sorted(sym_s_key_score_list, key=lambda tup: tup[-1])
+
+    # for i, elem in enumerate(sym_s_key_score_list):
+    #     k0, k1 = elem[2]
+    #     k
+    # print(solutions)
+
+    return solutions
 
 
 def main():
+    # sym = 'qqq'
+    # # sym = 'psq'
+    # sym = 'ONEQ'
+    # options_date = '2020-06-18'
+
+    # calls, puts, bid, ask = options_for_symbol(sym, date=options_date)
+
+    # print(calls)
+    # print(puts)
+    # print(infer_underlying_curprice(calls, puts))
+
     # main_compute_returns()
     # main_optimize_returns()
     main_arbitrage()
+
+    # calls, puts = options_
 
 
     # print(calls.shape)
